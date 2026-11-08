@@ -1,3 +1,11 @@
+import random
+import json
+import hashlib
+from pathlib import Path
+
+import numpy as np
+from PIL import Image
+from sklearn.model_selection import GroupShuffleSplit
 import argparse
 import os
 from collections import OrderedDict
@@ -14,10 +22,11 @@ from albumentations.core.composition import Compose, OneOf
 from sklearn.model_selection import train_test_split
 from torch.optim import lr_scheduler
 from tqdm import tqdm
-from albumentations import RandomRotate90,Resize
+from albumentations import RandomRotate90, Resize, Flip
 import archs
 import losses
 from dataset import Dataset
+from comparison_utils import ReferenceDataset, load_split, reference_scores
 from metrics import iou_score
 from utils import AverageMeter, str2bool
 from archs import UNext
@@ -96,6 +105,9 @@ def parse_args():
 
     parser.add_argument('--num_workers', default=4, type=int)
 
+    parser.add_argument('--split_file', required=True,
+                        help='Existing baseline split.json; never re-split')
+    parser.add_argument('--eval_size', default=256, type=int)
     config = parser.parse_args()
 
     return config
@@ -155,7 +167,7 @@ def validate(config, val_loader, model, criterion):
 
     with torch.no_grad():
         pbar = tqdm(total=len(val_loader))
-        for input, target, _ in val_loader:
+        for input, target, meta in val_loader:
             input = input.cuda()
             target = target.cuda()
 
@@ -170,7 +182,8 @@ def validate(config, val_loader, model, criterion):
             else:
                 output = model(input)
                 loss = criterion(output, target)
-                iou,dice = iou_score(output, target)
+                scores = reference_scores(output, meta["reference_mask"], 0.5)
+                iou, dice = scores["iou"].mean(), scores["dice"].mean()
 
             avg_meters['loss'].update(loss.item(), input.size(0))
             avg_meters['iou'].update(iou, input.size(0))
@@ -191,7 +204,16 @@ def validate(config, val_loader, model, criterion):
 
 
 def main():
+    os.chdir(Path(__file__).resolve().parent)
     config = vars(parse_args())
+    if config["deep_supervision"] or config["num_classes"] != 1:
+        raise ValueError("This comparison supports binary UNext without deep supervision")
+    seed = 41
+    config["seed"] = seed
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
 
     if config['name'] is None:
         if config['deep_supervision']:
@@ -199,7 +221,10 @@ def main():
         else:
             config['name'] = '%s_%s_woDS' % (config['dataset'], config['arch'])
     
-    os.makedirs('models/%s' % config['name'], exist_ok=True)
+    destination = Path('models') / config['name']
+    if destination.exists() and any(destination.iterdir()):
+        raise FileExistsError(f"Refusing to overwrite experiment: {destination}")
+    destination.mkdir(parents=True, exist_ok=True)
 
     print('-' * 20)
     for key in config:
@@ -215,7 +240,8 @@ def main():
     else:
         criterion = losses.__dict__[config['loss']]().cuda()
 
-    cudnn.benchmark = True
+    cudnn.benchmark = False
+    cudnn.deterministic = True
 
     # create model
     model = archs.__dict__[config['arch']](config['num_classes'],
@@ -239,7 +265,7 @@ def main():
             optimizer, T_max=config['epochs'], eta_min=config['min_lr'])
     elif config['scheduler'] == 'ReduceLROnPlateau':
         scheduler = lr_scheduler.ReduceLROnPlateau(optimizer, factor=config['factor'], patience=config['patience'],
-                                                   verbose=1, min_lr=config['min_lr'])
+                                                   min_lr=config['min_lr'])
     elif config['scheduler'] == 'MultiStepLR':
         scheduler = lr_scheduler.MultiStepLR(optimizer, milestones=[int(e) for e in config['milestones'].split(',')], gamma=config['gamma'])
     elif config['scheduler'] == 'ConstantLR':
@@ -247,15 +273,26 @@ def main():
     else:
         raise NotImplementedError
 
-    # Data loading code
-    img_ids = glob(os.path.join('inputs', config['dataset'], 'images', '*' + config['img_ext']))
-    img_ids = [os.path.splitext(os.path.basename(p))[0] for p in img_ids]
+    # Reuse the baseline's exact IDs and ordering; validate all files.
+    split = load_split(config['split_file'], config)
+    train_img_ids, val_img_ids = split['train'], split['val']
 
-    train_img_ids, val_img_ids = train_test_split(img_ids, test_size=0.2, random_state=41)
+    split_path = Path("models") / config["name"] / "split.json"
+    with split_path.open("w", encoding="utf-8") as f:
+        json.dump(
+            {"train": train_img_ids, "val": val_img_ids},
+            f,
+            ensure_ascii=False,
+            indent=2,
+        )
+
+    print(f"训练图像：{len(train_img_ids)} 张")
+    print(f"验证图像：{len(val_img_ids)} 张")
+    print(f"数据划分已保存：{split_path.resolve()}")
 
     train_transform = Compose([
         RandomRotate90(),
-        transforms.Flip(),
+        Flip(),
         Resize(config['input_h'], config['input_w']),
         transforms.Normalize(),
     ])
@@ -273,7 +310,8 @@ def main():
         mask_ext=config['mask_ext'],
         num_classes=config['num_classes'],
         transform=train_transform)
-    val_dataset = Dataset(
+    val_dataset = ReferenceDataset(
+        eval_size=config["eval_size"],
         img_ids=val_img_ids,
         img_dir=os.path.join('inputs', config['dataset'], 'images'),
         mask_dir=os.path.join('inputs', config['dataset'], 'masks'),
@@ -305,11 +343,12 @@ def main():
         ('val_dice', []),
     ])
 
-    best_iou = 0
+    best_iou = -1.0
     trigger = 0
     for epoch in range(config['epochs']):
         print('Epoch [%d/%d]' % (epoch, config['epochs']))
 
+        epoch_lr = optimizer.param_groups[0]["lr"]
         # train for one epoch
         train_log = train(config, train_loader, model, criterion, optimizer)
         # evaluate on validation set
@@ -319,12 +358,14 @@ def main():
             scheduler.step()
         elif config['scheduler'] == 'ReduceLROnPlateau':
             scheduler.step(val_log['loss'])
+        elif config['scheduler'] == 'MultiStepLR':
+            scheduler.step()
 
         print('loss %.4f - iou %.4f - val_loss %.4f - val_iou %.4f'
               % (train_log['loss'], train_log['iou'], val_log['loss'], val_log['iou']))
 
         log['epoch'].append(epoch)
-        log['lr'].append(config['lr'])
+        log['lr'].append(epoch_lr)
         log['loss'].append(train_log['loss'])
         log['iou'].append(train_log['iou'])
         log['val_loss'].append(val_log['loss'])
@@ -339,6 +380,10 @@ def main():
         if val_log['iou'] > best_iou:
             torch.save(model.state_dict(), 'models/%s/model.pth' %
                        config['name'])
+            with open(destination / 'best_epoch.json', 'w', encoding='utf-8') as f:
+                json.dump({'epoch': epoch, 'val_iou': float(val_log['iou']),
+                           'val_dice': float(val_log['dice']), 'threshold': 0.5,
+                           'eval_size': config['eval_size']}, f, indent=2)
             best_iou = val_log['iou']
             print("=> saved best model")
             trigger = 0

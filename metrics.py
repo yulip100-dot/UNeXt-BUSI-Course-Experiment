@@ -7,16 +7,27 @@ def iou_score(output, target):
     smooth = 1e-5
 
     if torch.is_tensor(output):
-        output = torch.sigmoid(output).data.cpu().numpy()
+        output = torch.sigmoid(output).detach().cpu().numpy()
     if torch.is_tensor(target):
-        target = target.data.cpu().numpy()
-    output_ = output > 0.5
-    target_ = target > 0.5
-    intersection = (output_ & target_).sum()
-    union = (output_ | target_).sum()
+        target = target.detach().cpu().numpy()
+
+    # 与预测掩膜保存时使用相同阈值
+    prediction = output >= 0.5
+    truth = target > 0.5
+
+    # 每张图像分别计算，再对批次取平均
+    axes = tuple(range(1, prediction.ndim))
+    intersection = np.logical_and(prediction, truth).sum(axis=axes)
+    union = np.logical_or(prediction, truth).sum(axis=axes)
+    pred_area = prediction.sum(axis=axes)
+    true_area = truth.sum(axis=axes)
+
     iou = (intersection + smooth) / (union + smooth)
-    dice = (2* iou) / (iou+1)
-    return iou, dice
+    dice = (2 * intersection + smooth) / (
+        pred_area + true_area + smooth
+    )
+
+    return float(iou.mean()), float(dice.mean())
 
 
 def dice_coef(output, target):
